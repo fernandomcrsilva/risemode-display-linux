@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+risemode-gui — interface gráfica do display Rise Mode, no estilo do app
+Windows original: tema escuro, leituras ao vivo e toggles °C/°F e W/%.
+
+As mudanças nos toggles são gravadas em /etc/risemode-display.conf e o
+daemon (risemode-display) aplica no visor do cooler em até 1 segundo.
+
+Requisito: pacote 'tk' (sudo pacman -S tk)
+"""
+
+import glob
+import json
+import os
+import time
+import tkinter as tk
+
+CONF_PATH = "/etc/risemode-display.conf"
+
+BG = "#101010"
+PANEL = "#1a1a1a"
+FG = "#e8e8e8"
+GREEN = "#3fcf3f"
+GRAY = "#2e2e2e"
+OUTLINE = "#3a3a3a"
+
+
+# ---------------------------------------------------------------- sensores ---
+
+def pick_cpu_temp_path():
+    pref_hw = ["k10temp", "zenpower", "coretemp", "cpu_thermal"]
+    pref_lb = ["tctl", "tdie", "package id 0", "cpu"]
+    sensors = []
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            name = open(os.path.join(hw, "name")).read().strip()
+        except OSError:
+            continue
+        for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+            lf = tf.replace("_input", "_label")
+            label = ""
+            if os.path.exists(lf):
+                try:
+                    label = open(lf).read().strip()
+                except OSError:
+                    pass
+            sensors.append((name, label.lower(), tf))
+    for hw in pref_hw:
+        cands = [s for s in sensors if s[0] == hw]
+        if cands:
+            for lb in pref_lb:
+                for n, l, p in cands:
+                    if l == lb:
+                        return p
+            return cands[0][2]
+    return sensors[0][2] if sensors else None
+
+
+class CpuUsage:
+    def __init__(self):
+        self.prev = self._read()
+
+    @staticmethod
+    def _read():
+        v = list(map(int, open("/proc/stat").readline().split()[1:]))
+        return v[3] + (v[4] if len(v) > 4 else 0), sum(v)
+
+    def percent(self):
+        idle, total = self._read()
+        pi, pt = self.prev
+        self.prev = (idle, total)
+        dt = total - pt
+        return 0.0 if dt <= 0 else 100.0 * (1 - (idle - pi) / dt)
+
+
+class CpuPower:
+    def __init__(self):
+        self.path = None
+        for p in sorted(glob.glob("/sys/class/powercap/*rapl*:0/energy_uj")):
+            try:
+                open(p).read()
+                self.path = p
+                break
+            except OSError:
+                pass
+        self.prev = None
+
+    def watts(self):
+        if not self.path:
+            return None
+        try:
+            e = int(open(self.path).read())
+        except OSError:
+            return None
+        now = time.monotonic()
+        if self.prev is None:
+            self.prev = (e, now)
+            return 0.0
+        pe, pt = self.prev
+        self.prev = (e, now)
+        de, dt = e - pe, now - pt
+        return max(0.0, de / 1e6 / dt) if dt > 0 and de >= 0 else 0.0
+
+
+# ------------------------------------------------------------------ config ---
+
+def load_conf():
+    try:
+        with open(CONF_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_conf(conf, status_cb):
+    try:
+        with open(CONF_PATH, "w") as f:
+            json.dump(conf, f, indent=2)
+        status_cb("")
+    except OSError:
+        status_cb("Sem permissão em " + CONF_PATH +
+                  " — rode: sudo chmod 666 " + CONF_PATH)
+
+
+# --------------------------------------------------------------------- GUI ---
+
+class Toggle(tk.Canvas):
+    """Toggle pílula com duas opções, no estilo do app original."""
+
+    W, H, R = 130, 44, 21
+
+    def __init__(self, master, left, right, command, **kw):
+        super().__init__(master, width=self.W, height=self.H,
+                         bg=PANEL, highlightthickness=0, **kw)
+        self.left_txt, self.right_txt = left, right
+        self.command = command
+        self.state_right = False
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _pill(self, x0, y0, x1, y1, **kw):
+        r = (y1 - y0) / 2
+        self.create_oval(x0, y0, x0 + 2 * r, y1, **kw)
+        self.create_oval(x1 - 2 * r, y0, x1, y1, **kw)
+        self.create_rectangle(x0 + r, y0, x1 - r, y1, **kw)
+
+    def _draw(self):
+        self.delete("all")
+        self._pill(2, 2, self.W - 2, self.H - 2,
+                   fill=GRAY, outline=GRAY)
+        half = self.W // 2
+        if self.state_right:
+            self._pill(half, 4, self.W - 4, self.H - 4,
+                       fill=GREEN, outline=GREEN)
+        else:
+            self._pill(4, 4, half, self.H - 4,
+                       fill=GREEN, outline=GREEN)
+        self.create_text(self.W * 0.27, self.H / 2, text=self.left_txt,
+                         fill="#0c0c0c" if not self.state_right else FG,
+                         font=("Sans", 13, "bold"))
+        self.create_text(self.W * 0.73, self.H / 2, text=self.right_txt,
+                         fill="#0c0c0c" if self.state_right else FG,
+                         font=("Sans", 13, "bold"))
+
+    def set(self, right):
+        self.state_right = bool(right)
+        self._draw()
+
+    def _click(self, _e):
+        self.state_right = not self.state_right
+        self._draw()
+        self.command(self.state_right)
+
+
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Rise Mode Display")
+        self.root.configure(bg=BG)
+        self.root.resizable(False, False)
+
+        self.temp_path = pick_cpu_temp_path()
+        self.usage = CpuUsage()
+        self.power = CpuPower()
+        self.conf = {"unit": "c", "mode": "percent", "enabled": True, **load_conf()}
+
+        panel = tk.Frame(self.root, bg=PANEL, padx=36, pady=28,
+                         highlightbackground=OUTLINE, highlightthickness=1)
+        panel.pack(padx=18, pady=18)
+
+        row = tk.Frame(panel, bg=PANEL)
+        row.pack(pady=(4, 22))
+        tk.Label(row, text="🌡", font=("Sans", 30), fg=FG, bg=PANEL).pack(side="left")
+        self.temp_lbl = tk.Label(row, text="--", font=("Sans", 34, "bold"),
+                                 fg=FG, bg=PANEL, width=4)
+        self.temp_lbl.pack(side="left")
+        self.temp_unit = tk.Label(row, text="°C", font=("Sans", 16),
+                                  fg=FG, bg=PANEL)
+        self.temp_unit.pack(side="left", anchor="n", pady=8)
+
+        tk.Label(row, text="   ", bg=PANEL).pack(side="left")
+        tk.Label(row, text="🖥", font=("Sans", 28), fg=FG, bg=PANEL).pack(side="left")
+        self.val_lbl = tk.Label(row, text="--", font=("Sans", 34, "bold"),
+                                fg=FG, bg=PANEL, width=4)
+        self.val_lbl.pack(side="left")
+        self.val_unit = tk.Label(row, text="%", font=("Sans", 16),
+                                 fg=FG, bg=PANEL)
+        self.val_unit.pack(side="left", anchor="n", pady=8)
+
+        toggles = tk.Frame(panel, bg=PANEL)
+        toggles.pack()
+        self.t_unit = Toggle(toggles, "°C", "°F", self.on_unit)
+        self.t_unit.grid(row=0, column=0, padx=18)
+        self.t_mode = Toggle(toggles, "W", "%", self.on_mode)
+        self.t_mode.grid(row=0, column=1, padx=18)
+
+        self.power_btn = tk.Label(panel, text="⏻  Desligar display",
+                                  font=("Sans", 12, "bold"), fg="#0c0c0c",
+                                  bg=GREEN, padx=16, pady=8, cursor="hand2")
+        self.power_btn.pack(pady=(22, 0))
+        self.power_btn.bind("<Button-1>", self.on_power)
+
+        self.status = tk.Label(self.root, text="", fg="#ff8060", bg=BG,
+                               font=("Sans", 9))
+        self.status.pack(pady=(0, 6))
+
+        self.t_unit.set(str(self.conf.get("unit", "c")).lower().startswith("f"))
+        self.t_mode.set(str(self.conf.get("mode", "percent")) != "watts")
+        self.refresh_power()
+        self.tick()
+
+    def on_unit(self, right):
+        self.conf["unit"] = "f" if right else "c"
+        save_conf(self.conf, self.set_status)
+
+    def on_mode(self, right):
+        self.conf["mode"] = "percent" if right else "watts"
+        save_conf(self.conf, self.set_status)
+
+    def on_power(self, _e=None):
+        self.conf["enabled"] = not self.conf.get("enabled", True)
+        save_conf(self.conf, self.set_status)
+        self.refresh_power()
+
+    def refresh_power(self):
+        on = self.conf.get("enabled", True)
+        if on:
+            self.power_btn.config(text="⏻  Desligar display", bg=GREEN, fg="#0c0c0c")
+        else:
+            self.power_btn.config(text="⏻  Ligar display", bg=GRAY, fg=FG)
+        dim = FG if on else "#5a5a5a"
+        for w in (self.temp_lbl, self.temp_unit, self.val_lbl, self.val_unit):
+            w.config(fg=dim)
+
+    def set_status(self, msg):
+        self.status.config(text=msg)
+
+    def tick(self):
+        fahrenheit = self.conf["unit"] == "f"
+        percent = self.conf["mode"] != "watts"
+        try:
+            t = int(open(self.temp_path).read()) / 1000.0 if self.temp_path else 0
+        except OSError:
+            t = 0
+        if fahrenheit:
+            t = t * 9 / 5 + 32
+        if percent:
+            v, vs = self.usage.percent(), "%"
+        else:
+            w = self.power.watts()
+            if w is None:
+                v, vs = self.usage.percent(), "%"
+                self.set_status("Leitura de watts indisponível neste sistema")
+            else:
+                v, vs = w, "W"
+        self.temp_lbl.config(text=f"{t:.0f}")
+        self.temp_unit.config(text="°F" if fahrenheit else "°C")
+        self.val_lbl.config(text=f"{v:.0f}")
+        self.val_unit.config(text=vs)
+        self.root.after(1000, self.tick)
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    App().run()

@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+risemode-display — Driver Linux para o display de temperatura dos coolers
+Rise Mode (software Windows "CPU TEMP Monitor" / Ocypus Digital).
+
+Protocolo obtido por engenharia reversa do DeviceDriver.exe (v1.0.0.3). Script v1.1 com modo probe:
+
+  Dispositivo : USB HID, VID 0x1A2C (China Resource Semico), PID 0x4984
+  Transporte  : HID Feature Report, Report ID 0x07
+  Handshake   : [0x07, 0xFD, 0x00 ... ]                      (64 bytes)
+  Dados (1/s) : [0x07, T_centena, T_dezena, T_unidade,
+                 flags, U_centena, U_dezena, U_unidade, 0...] (65 bytes)
+      flags bit0 = Fahrenheit (0 = Celsius)
+      flags bit4 = modo GPU
+
+Sem dependências externas: fala diretamente com /dev/hidraw* via ioctl
+(HIDIOCSFEATURE), lê temperatura de /sys/class/hwmon e uso de /proc/stat.
+
+Uso:
+  sudo risemode-display list          # lista dispositivos e sensores
+  sudo risemode-display run           # roda em primeiro plano (Ctrl+C p/ sair)
+  sudo risemode-display run -u f      # Fahrenheit
+  sudo risemode-display run --gpu     # mostra temperatura/uso da GPU
+  sudo risemode-display off           # apaga o display
+  sudo risemode-display install       # instala serviço systemd + regra udev
+"""
+
+import argparse
+import array
+import fcntl
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VID = 0x1A2C
+PID_DEFAULT = 0x4984
+REPORT_ID = 0x07
+DATA_LEN = 65          # report ID + 64 bytes (igual ao HidD_SetFeature do Windows)
+INIT_LEN = 64
+REFRESH = 1.0          # o app original envia a cada 1000 ms
+
+FLAG_FAHRENHEIT = 0x01
+FLAG_PERCENT = 0x10     # com o bit: símbolo "%"; sem ele: símbolo "W" (watts)
+CONF_PATH = "/etc/risemode-display.conf"
+
+UDEV_RULE_PATH = "/etc/udev/rules.d/99-risemode-display.rules"
+SERVICE_PATH = "/etc/systemd/system/risemode-display.service"
+INSTALL_BIN = "/usr/local/bin/risemode-display"
+
+# Sensores de CPU preferidos, em ordem (AMD, Intel, zenpower)
+CPU_HWMON_PREF = ["k10temp", "zenpower", "coretemp", "cpu_thermal"]
+CPU_LABEL_PREF = ["tctl", "tdie", "package id 0", "cpu"]
+
+
+# ---------------------------------------------------------------- hidraw ---
+
+def _ioc(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (ord(typ) << 8) | nr
+
+
+def hidiocsfeature(length):
+    # HIDIOCSFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)
+    return _ioc(3, "H", 0x06, length)
+
+
+def find_devices(pid=None, any_semico=False):
+    """Retorna lista de (caminho_hidraw, vid, pid, nome)."""
+    found = []
+    for dev in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent = os.path.join(dev, "device", "uevent")
+        try:
+            info = open(uevent).read()
+        except OSError:
+            continue
+        m = re.search(r"HID_ID=\w+:0000([0-9A-Fa-f]{4}):0000([0-9A-Fa-f]{4})", info)
+        if not m:
+            continue
+        v, p = int(m.group(1), 16), int(m.group(2), 16)
+        name_m = re.search(r"HID_NAME=(.*)", info)
+        name = name_m.group(1).strip() if name_m else "?"
+        if v != VID:
+            continue
+        if pid is not None and p != pid and not any_semico:
+            continue
+        found.append(("/dev/" + os.path.basename(dev), v, p, name))
+    return found
+
+
+class Display:
+    def __init__(self, path, via="feature", fmt="new"):
+        self.path = path
+        self.via = via      # "feature" (HidD_SetFeature) ou "write" (output report)
+        self.fmt = fmt      # "new" (layout do DeviceDriver.exe) ou "a40" (Ocypus antigo)
+        self.fd = os.open(path, os.O_RDWR)
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def _send_raw(self, payload):
+        if self.via == "write":
+            os.write(self.fd, bytes(payload))
+        else:
+            buf = array.array("B", payload)
+            fcntl.ioctl(self.fd, hidiocsfeature(len(buf)), buf, True)
+
+    def handshake(self):
+        pkt = bytearray(INIT_LEN)
+        pkt[0] = REPORT_ID
+        pkt[1] = 0xFD
+        self._send_raw(pkt)
+
+    def send(self, temp, value, fahrenheit=False, percent=True):
+        t = max(0, min(999, int(round(temp))))
+        u = max(0, min(999 if not percent else 100, int(round(value))))
+        pkt = bytearray(DATA_LEN)
+        pkt[0] = REPORT_ID
+        if self.fmt == "a40":
+            # layout antigo Ocypus: dezena/unidade nos bytes 5/6, unidade térmica no 7
+            pkt[5] = (t // 10) % 10
+            pkt[6] = t % 10
+            pkt[7] = 1 if fahrenheit else 0
+        else:
+            pkt[1] = (t // 100) % 10
+            pkt[2] = (t // 10) % 10
+            pkt[3] = t % 10
+            pkt[4] = (FLAG_FAHRENHEIT if fahrenheit else 0) | (FLAG_PERCENT if percent else 0)
+            pkt[5] = (u // 100) % 10
+            pkt[6] = (u // 10) % 10
+            pkt[7] = u % 10
+        self._send_raw(pkt)
+
+    def blank(self):
+        pkt = bytearray(DATA_LEN)
+        pkt[0] = REPORT_ID
+        self._send_raw(pkt)
+
+
+# --------------------------------------------------------------- sensores ---
+
+def hwmon_list():
+    out = []
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            name = open(os.path.join(hw, "name")).read().strip()
+        except OSError:
+            continue
+        for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+            label_file = tf.replace("_input", "_label")
+            label = ""
+            if os.path.exists(label_file):
+                try:
+                    label = open(label_file).read().strip()
+                except OSError:
+                    pass
+            out.append((name, label, tf))
+    return out
+
+
+def pick_cpu_sensor(substr=None):
+    sensors = hwmon_list()
+    if substr:
+        for name, label, path in sensors:
+            if substr.lower() in name.lower() or substr.lower() in label.lower():
+                return name, label, path
+        return None
+    for pref in CPU_HWMON_PREF:
+        cands = [s for s in sensors if s[0] == pref]
+        if not cands:
+            continue
+        for lp in CPU_LABEL_PREF:
+            for name, label, path in cands:
+                if label.lower() == lp:
+                    return name, label, path
+        return cands[0]
+    return sensors[0] if sensors else None
+
+
+def read_temp(path):
+    return int(open(path).read().strip()) / 1000.0
+
+
+def pick_gpu_sensor():
+    # AMD/Intel via hwmon
+    for name, label, path in hwmon_list():
+        if name in ("amdgpu", "radeon", "i915", "xe") and label.lower() in ("edge", "", "gpu"):
+            return ("hwmon", name, path)
+    # NVIDIA via nvidia-smi
+    if shutil.which("nvidia-smi"):
+        return ("nvidia", "nvidia-smi", None)
+    return None
+
+
+def read_gpu(sensor):
+    kind, _, path = sensor
+    if kind == "hwmon":
+        temp = read_temp(path)
+        usage = 0.0
+        for busy in glob.glob("/sys/class/drm/card*/device/gpu_busy_percent"):
+            try:
+                usage = float(open(busy).read().strip())
+                break
+            except OSError:
+                pass
+        return temp, usage
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip().splitlines()
+    t, u = out[0].split(",")
+    return float(t), float(u)
+
+
+class CpuUsage:
+    def __init__(self):
+        self.prev = self._read()
+
+    @staticmethod
+    def _read():
+        parts = open("/proc/stat").readline().split()[1:]
+        vals = list(map(int, parts))
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return idle, sum(vals)
+
+    def percent(self):
+        idle, total = self._read()
+        pidle, ptotal = self.prev
+        self.prev = (idle, total)
+        dt = total - ptotal
+        if dt <= 0:
+            return 0.0
+        return 100.0 * (1.0 - (idle - pidle) / dt)
+
+
+# ------------------------------------------------------------------ config ---
+
+def load_conf():
+    import json
+    try:
+        with open(CONF_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def ensure_conf(defaults):
+    import json
+    if not os.path.exists(CONF_PATH):
+        try:
+            with open(CONF_PATH, "w") as f:
+                json.dump(defaults, f, indent=2)
+            os.chmod(CONF_PATH, 0o666)  # permite a GUI do usuário alterar
+        except OSError:
+            pass
+
+
+class CpuPower:
+    """Potência da CPU em watts via RAPL (powercap) ou hwmon."""
+
+    def __init__(self):
+        self.energy_path = None
+        self.power_path = None
+        for p in sorted(glob.glob("/sys/class/powercap/*rapl*:0/energy_uj")):
+            try:
+                open(p).read()
+                self.energy_path = p
+                break
+            except OSError:
+                continue
+        if not self.energy_path:
+            for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*/power1_input")):
+                try:
+                    open(hw).read()
+                    self.power_path = hw
+                    break
+                except OSError:
+                    continue
+        self.prev = None
+
+    def available(self):
+        return bool(self.energy_path or self.power_path)
+
+    def watts(self):
+        if self.power_path:
+            try:
+                return int(open(self.power_path).read()) / 1e6
+            except OSError:
+                return 0.0
+        try:
+            e = int(open(self.energy_path).read())
+        except OSError:
+            return 0.0
+        now = time.monotonic()
+        if self.prev is None:
+            self.prev = (e, now)
+            return 0.0
+        pe, pt = self.prev
+        self.prev = (e, now)
+        dt = now - pt
+        de = e - pe
+        if de < 0:  # contador deu a volta
+            return 0.0
+        return de / 1e6 / dt if dt > 0 else 0.0
+
+
+# ---------------------------------------------------------------- comandos ---
+
+def open_display(args):
+    if args.node:
+        path, name = args.node, "(manual)"
+    else:
+        devs = find_devices(args.pid)
+        if not devs and not args.strict:
+            devs = find_devices(any_semico=True)
+        if not devs:
+            sys.exit(
+                "Nenhum display encontrado (VID 1a2c). Verifique o cabo USB interno\n"
+                "do cooler e rode 'risemode-display list'."
+            )
+        path, v, p, name = devs[0]
+    print(f"Dispositivo: {path}  ({name})  via={args.via} fmt={args.fmt}")
+    d = Display(path, via=args.via, fmt=args.fmt)
+    try:
+        d.handshake()
+    except OSError:
+        pass
+    return d
+
+
+def cmd_probe(args):
+    devs = find_devices(args.pid)
+    if not devs:
+        devs = find_devices(any_semico=True)
+    if not devs:
+        sys.exit("Nenhum dispositivo 1a2c encontrado.")
+    combos = []
+    for path, v, p, name in devs:
+        for via in ("feature", "write"):
+            for fmt in ("new", "a40"):
+                combos.append((path, via, fmt))
+    print(f"{len(combos)} combinações para testar. Cada uma tenta mostrar '88'")
+    print("no visor por ~4 s. Anote o NÚMERO da tentativa que acender o display.\n")
+    for i, (path, via, fmt) in enumerate(combos, 1):
+        print(f"[{i}/{len(combos)}] node={path} via={via} fmt={fmt} ... ", end="", flush=True)
+        try:
+            d = Display(path, via=via, fmt=fmt)
+        except OSError as e:
+            print(f"não abriu ({e})")
+            continue
+        ok = True
+        try:
+            try:
+                d.handshake()
+            except OSError:
+                pass
+            for _ in range(4):
+                d.send(88, 88)
+                time.sleep(1)
+        except OSError as e:
+            ok = False
+            print(f"erro ao enviar ({e})")
+        finally:
+            d.close()
+        if ok:
+            print("enviado. O visor mostrou 88?")
+            print(f"    -> se SIM, use:  sudo risemode-display run --node {path} --via {via} --fmt {fmt}")
+        time.sleep(1)
+    print("\nSe nenhuma tentativa acendeu o visor, me mande a saída completa deste probe.")
+
+
+def cmd_list(args):
+    print("Dispositivos HID Semico (VID 1a2c):")
+    devs = find_devices(any_semico=True)
+    if not devs:
+        print("  (nenhum encontrado)")
+    for path, v, p, name in devs:
+        mark = "  <- alvo" if p == (args.pid or PID_DEFAULT) else ""
+        print(f"  {path}  {v:04x}:{p:04x}  {name}{mark}")
+    print("\nSensores de temperatura (hwmon):")
+    chosen = pick_cpu_sensor(args.sensor)
+    for name, label, path in hwmon_list():
+        cur = ""
+        try:
+            cur = f"{read_temp(path):5.1f}°C"
+        except OSError:
+            pass
+        mark = "  <- usado p/ CPU" if chosen and path == chosen[2] else ""
+        print(f"  {name:<12} {label:<14} {cur}{mark}")
+    gpu = pick_gpu_sensor()
+    print(f"\nGPU: {gpu[1] if gpu else 'nenhuma detectada'}")
+
+
+def cmd_run(args):
+    d = open_display(args)
+    usage = CpuUsage()
+    power = CpuPower()
+    gpu_sensor = pick_gpu_sensor() if args.gpu else None
+    if args.gpu and not gpu_sensor:
+        sys.exit("Modo GPU pedido, mas nenhuma GPU foi detectada.")
+    cpu_sensor = pick_cpu_sensor(args.sensor)
+    if not args.gpu and not cpu_sensor:
+        sys.exit("Nenhum sensor de CPU encontrado em /sys/class/hwmon.")
+    if cpu_sensor:
+        print(f"Sensor CPU : {cpu_sensor[0]} {cpu_sensor[1]} ({cpu_sensor[2]})")
+    if gpu_sensor:
+        print(f"Sensor GPU : {gpu_sensor[1]}")
+    defaults = {"unit": "f" if args.unit.lower().startswith("f") else "c",
+                "mode": "percent", "enabled": True}
+    ensure_conf(defaults)
+    print(f"Config     : {CONF_PATH} (editável pela GUI)")
+    print("Enviando para o display a cada 1 s. Ctrl+C para parar.")
+    was_off = False
+    try:
+        while True:
+            conf = {**defaults, **load_conf()}
+            fahrenheit = str(conf.get("unit", "c")).lower().startswith("f")
+            percent = str(conf.get("mode", "percent")) != "watts"
+            enabled = bool(conf.get("enabled", True))
+            if not enabled:
+                if not was_off:
+                    try:
+                        d.blank()
+                        if sys.stdout.isatty():
+                            print("\rDisplay desligado pela configuração.   ", end="", flush=True)
+                    except OSError:
+                        pass
+                    was_off = True
+                time.sleep(REFRESH)
+                continue
+            was_off = False
+            try:
+                if args.gpu:
+                    temp, load = read_gpu(gpu_sensor)
+                else:
+                    temp = read_temp(cpu_sensor[2])
+                    load = usage.percent()
+                value = load if percent or not power.available() else power.watts()
+                if fahrenheit:
+                    temp = temp * 9 / 5 + 32
+                d.send(temp, value, fahrenheit, percent if power.available() or percent else True)
+                if sys.stdout.isatty():
+                    sym = "°F" if fahrenheit else "°C"
+                    vsym = "%" if percent else "W"
+                    print(f"\r{temp:5.1f}{sym}  {value:3.0f}{vsym}   ", end="", flush=True)
+            except OSError as e:
+                print(f"\nDispositivo indisponível ({e}); tentando reconectar...")
+                d.close()
+                time.sleep(3)
+                try:
+                    d = open_display(args)
+                except SystemExit:
+                    time.sleep(5)
+            time.sleep(REFRESH)
+    except KeyboardInterrupt:
+        print("\nEncerrando.")
+        try:
+            d.blank()
+        except OSError:
+            pass
+        d.close()
+
+
+def cmd_off(args):
+    d = open_display(args)
+    d.blank()
+    d.close()
+    print("Display apagado.")
+
+
+def cmd_install(args):
+    if os.geteuid() != 0:
+        sys.exit("Rode como root: sudo risemode-display install")
+    src = os.path.realpath(__file__)
+    if src != INSTALL_BIN:
+        shutil.copy(src, INSTALL_BIN)
+        os.chmod(INSTALL_BIN, 0o755)
+        print(f"Copiado para {INSTALL_BIN}")
+    with open(UDEV_RULE_PATH, "w") as f:
+        f.write(
+            'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1a2c", MODE="0660", TAG+="uaccess"\n'
+        )
+    print(f"Regra udev: {UDEV_RULE_PATH}")
+    extra = []
+    if args.unit.lower().startswith("f"):
+        extra.append("-u f")
+    if args.gpu:
+        extra.append("--gpu")
+    if args.sensor:
+        extra.append(f"-s {args.sensor}")
+    if args.via != "feature":
+        extra.append(f"--via {args.via}")
+    if args.fmt != "new":
+        extra.append(f"--fmt {args.fmt}")
+    if args.node:
+        extra.append(f"--node {args.node}")
+    with open(SERVICE_PATH, "w") as f:
+        f.write(f"""[Unit]
+Description=Rise Mode cooler temperature display
+After=multi-user.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+ExecStart={INSTALL_BIN} run {' '.join(extra)}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+""")
+    print(f"Serviço systemd: {SERVICE_PATH}")
+    subprocess.run(["udevadm", "control", "--reload-rules"], check=False)
+    subprocess.run(["udevadm", "trigger"], check=False)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "risemode-display"], check=False)
+    print("Instalado e iniciado. Veja: systemctl status risemode-display")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Display de temperatura dos coolers Rise Mode no Linux"
+    )
+    ap.add_argument("--pid", type=lambda x: int(x, 0), default=PID_DEFAULT,
+                    help="PID USB do display (padrão 0x4984)")
+    ap.add_argument("--strict", action="store_true",
+                    help="não aceitar outros PIDs do mesmo fabricante")
+    ap.add_argument("-u", "--unit", default="c", choices=["c", "f", "C", "F"],
+                    help="unidade de temperatura (c ou f)")
+    ap.add_argument("-s", "--sensor", default=None,
+                    help="substring do sensor hwmon de CPU (ex.: k10temp, coretemp)")
+    ap.add_argument("--gpu", action="store_true",
+                    help="mostrar temperatura/uso da GPU em vez da CPU")
+    ap.add_argument("--node", default=None,
+                    help="usar um /dev/hidrawN específico")
+    ap.add_argument("--via", default="feature", choices=["feature", "write"],
+                    help="método de envio HID (padrão: feature)")
+    ap.add_argument("--fmt", default="new", choices=["new", "a40"],
+                    help="layout do pacote (padrão: new)")
+    ap.add_argument("command", nargs="?", default="run",
+                    choices=["run", "list", "off", "install", "probe"])
+    args = ap.parse_args()
+    {"run": cmd_run, "list": cmd_list, "off": cmd_off, "install": cmd_install,
+     "probe": cmd_probe}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
