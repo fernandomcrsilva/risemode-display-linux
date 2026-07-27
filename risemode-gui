@@ -13,10 +13,13 @@ Requisito: pacote 'tk' (sudo pacman -S tk)
 import glob
 import json
 import os
+import shutil
+import subprocess
 import time
 import tkinter as tk
 
 CONF_PATH = "/etc/risemode-display.conf"
+STATUS_PATH = "/run/risemode-display-status.json"
 
 BG = "#101010"
 PANEL = "#1a1a1a"
@@ -103,6 +106,44 @@ class CpuPower:
         return max(0.0, de / 1e6 / dt) if dt > 0 and de >= 0 else 0.0
 
 
+class GpuPower:
+    """Potência da GPU em watts via hwmon (amdgpu/radeon) ou nvidia-smi."""
+
+    def __init__(self):
+        self.paths = []
+        for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            try:
+                name = open(os.path.join(hw, "name")).read().strip()
+            except OSError:
+                continue
+            if name in ("amdgpu", "radeon", "nouveau"):
+                for pf in ("power1_average", "power1_input"):
+                    p = os.path.join(hw, pf)
+                    if os.path.exists(p):
+                        self.paths.append(p)
+                        break
+        self.nvsmi = None if self.paths else shutil.which("nvidia-smi")
+
+    def watts(self):
+        w = 0.0
+        for p in self.paths:
+            try:
+                w += int(open(p).read()) / 1e6
+            except OSError:
+                pass
+        if self.nvsmi:
+            try:
+                out = subprocess.run(
+                    [self.nvsmi, "--query-gpu=power.draw",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout
+                w += sum(float(x) for x in out.split())
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                pass
+        return w
+
+
 # ------------------------------------------------------------------ config ---
 
 def load_conf():
@@ -183,6 +224,7 @@ class App:
         self.temp_path = pick_cpu_temp_path()
         self.usage = CpuUsage()
         self.power = CpuPower()
+        self.gpu_power = GpuPower()
         self.conf = {"unit": "c", "mode": "percent", "enabled": True, **load_conf()}
 
         panel = tk.Frame(self.root, bg=PANEL, padx=36, pady=28,
@@ -215,6 +257,14 @@ class App:
         self.t_mode = Toggle(toggles, "W", "%", self.on_mode)
         self.t_mode.grid(row=0, column=1, padx=18)
 
+        self.sys_var = tk.BooleanVar(value=self.conf.get("mode") == "system")
+        self.sys_chk = tk.Checkbutton(
+            panel, text="W do sistema inteiro (CPU + GPU)",
+            variable=self.sys_var, command=self.on_mode_change,
+            bg=PANEL, fg=FG, selectcolor=GRAY, activebackground=PANEL,
+            activeforeground=FG, highlightthickness=0, font=("Sans", 11))
+        self.sys_chk.pack(pady=(14, 0))
+
         self.power_btn = tk.Label(panel, text="⏻  Desligar display",
                                   font=("Sans", 12, "bold"), fg="#0c0c0c",
                                   bg=GREEN, padx=16, pady=8, cursor="hand2")
@@ -226,7 +276,7 @@ class App:
         self.status.pack(pady=(0, 6))
 
         self.t_unit.set(str(self.conf.get("unit", "c")).lower().startswith("f"))
-        self.t_mode.set(str(self.conf.get("mode", "percent")) != "watts")
+        self.t_mode.set(str(self.conf.get("mode", "percent")) not in ("watts", "system"))
         self.refresh_power()
         self.tick()
 
@@ -235,7 +285,13 @@ class App:
         save_conf(self.conf, self.set_status)
 
     def on_mode(self, right):
-        self.conf["mode"] = "percent" if right else "watts"
+        self.on_mode_change()
+
+    def on_mode_change(self):
+        if self.t_mode.state_right:
+            self.conf["mode"] = "percent"
+        else:
+            self.conf["mode"] = "system" if self.sys_var.get() else "watts"
         save_conf(self.conf, self.set_status)
 
     def on_power(self, _e=None):
@@ -257,23 +313,41 @@ class App:
         self.status.config(text=msg)
 
     def tick(self):
-        fahrenheit = self.conf["unit"] == "f"
-        percent = self.conf["mode"] != "watts"
+        # preferir a leitura do daemon (roda como root e enxerga o RAPL)
+        st = None
         try:
-            t = int(open(self.temp_path).read()) / 1000.0 if self.temp_path else 0
-        except OSError:
-            t = 0
-        if fahrenheit:
-            t = t * 9 / 5 + 32
-        if percent:
-            v, vs = self.usage.percent(), "%"
+            with open(STATUS_PATH) as f:
+                st = json.load(f)
+            if time.time() - st.get("ts", 0) > 3:
+                st = None
+        except (OSError, ValueError):
+            st = None
+        if st:
+            fahrenheit = st["fahrenheit"]
+            t = st["temp"]
+            v, vs = st["value"], "W" if st["watts"] else "%"
+            if self.status.cget("text").startswith("Leitura de watts"):
+                self.set_status("")
         else:
-            w = self.power.watts()
-            if w is None:
+            fahrenheit = self.conf["unit"] == "f"
+            percent = self.conf["mode"] not in ("watts", "system")
+            try:
+                t = int(open(self.temp_path).read()) / 1000.0 if self.temp_path else 0
+            except OSError:
+                t = 0
+            if fahrenheit:
+                t = t * 9 / 5 + 32
+            if percent:
                 v, vs = self.usage.percent(), "%"
-                self.set_status("Leitura de watts indisponível neste sistema")
             else:
-                v, vs = w, "W"
+                w = self.power.watts()
+                if w is None:
+                    v, vs = self.usage.percent(), "%"
+                    self.set_status("Leitura de watts indisponível neste sistema")
+                else:
+                    if self.conf["mode"] == "system":
+                        w += self.gpu_power.watts()
+                    v, vs = w, "W"
         self.temp_lbl.config(text=f"{t:.0f}")
         self.temp_unit.config(text="°F" if fahrenheit else "°C")
         self.val_lbl.config(text=f"{v:.0f}")

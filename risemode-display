@@ -47,6 +47,7 @@ REFRESH = 1.0          # o app original envia a cada 1000 ms
 FLAG_FAHRENHEIT = 0x01
 FLAG_PERCENT = 0x10     # com o bit: símbolo "%"; sem ele: símbolo "W" (watts)
 CONF_PATH = "/etc/risemode-display.conf"
+STATUS_PATH = "/run/risemode-display-status.json"
 
 UDEV_RULE_PATH = "/etc/udev/rules.d/99-risemode-display.rules"
 SERVICE_PATH = "/etc/systemd/system/risemode-display.service"
@@ -251,6 +252,20 @@ def load_conf():
         return {}
 
 
+def write_status(temp, value, watts_mode, fahrenheit):
+    """Publica a leitura atual p/ a GUI (que não pode ler RAPL sem root)."""
+    import json
+    try:
+        tmp = STATUS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"temp": temp, "value": value, "watts": watts_mode,
+                       "fahrenheit": fahrenheit, "ts": time.time()}, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATUS_PATH)
+    except OSError:
+        pass
+
+
 def ensure_conf(defaults):
     import json
     if not os.path.exists(CONF_PATH):
@@ -309,6 +324,44 @@ class CpuPower:
         if de < 0:  # contador deu a volta
             return 0.0
         return de / 1e6 / dt if dt > 0 else 0.0
+
+
+class GpuPower:
+    """Potência da GPU em watts via hwmon (amdgpu/radeon) ou nvidia-smi."""
+
+    def __init__(self):
+        self.paths = []
+        for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            try:
+                name = open(os.path.join(hw, "name")).read().strip()
+            except OSError:
+                continue
+            if name in ("amdgpu", "radeon", "nouveau"):
+                for pf in ("power1_average", "power1_input"):
+                    p = os.path.join(hw, pf)
+                    if os.path.exists(p):
+                        self.paths.append(p)
+                        break
+        self.nvsmi = None if self.paths else shutil.which("nvidia-smi")
+
+    def watts(self):
+        w = 0.0
+        for p in self.paths:
+            try:
+                w += int(open(p).read()) / 1e6
+            except OSError:
+                pass
+        if self.nvsmi:
+            try:
+                out = subprocess.run(
+                    [self.nvsmi, "--query-gpu=power.draw",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout
+                w += sum(float(x) for x in out.split())
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                pass
+        return w
 
 
 # ---------------------------------------------------------------- comandos ---
@@ -402,6 +455,7 @@ def cmd_run(args):
     d = open_display(args)
     usage = CpuUsage()
     power = CpuPower()
+    gpu_power = GpuPower()
     gpu_sensor = pick_gpu_sensor() if args.gpu else None
     if args.gpu and not gpu_sensor:
         sys.exit("Modo GPU pedido, mas nenhuma GPU foi detectada.")
@@ -422,7 +476,8 @@ def cmd_run(args):
         while True:
             conf = {**defaults, **load_conf()}
             fahrenheit = str(conf.get("unit", "c")).lower().startswith("f")
-            percent = str(conf.get("mode", "percent")) != "watts"
+            mode = str(conf.get("mode", "percent"))  # percent | watts | system
+            watts_mode = mode in ("watts", "system") and power.available()
             enabled = bool(conf.get("enabled", True))
             if not enabled:
                 if not was_off:
@@ -442,13 +497,18 @@ def cmd_run(args):
                 else:
                     temp = read_temp(cpu_sensor[2])
                     load = usage.percent()
-                value = load if percent or not power.available() else power.watts()
+                if watts_mode:
+                    # ponytail: "system" = CPU (RAPL) + GPU; não mede RAM/placa/discos
+                    value = power.watts() + (gpu_power.watts() if mode == "system" else 0.0)
+                else:
+                    value = load
                 if fahrenheit:
                     temp = temp * 9 / 5 + 32
-                d.send(temp, value, fahrenheit, percent if power.available() or percent else True)
+                d.send(temp, value, fahrenheit, not watts_mode)
+                write_status(temp, value, watts_mode, fahrenheit)
                 if sys.stdout.isatty():
                     sym = "°F" if fahrenheit else "°C"
-                    vsym = "%" if percent else "W"
+                    vsym = "W" if watts_mode else "%"
                     print(f"\r{temp:5.1f}{sym}  {value:3.0f}{vsym}   ", end="", flush=True)
             except OSError as e:
                 print(f"\nDispositivo indisponível ({e}); tentando reconectar...")
@@ -483,6 +543,11 @@ def cmd_install(args):
         shutil.copy(src, INSTALL_BIN)
         os.chmod(INSTALL_BIN, 0o755)
         print(f"Copiado para {INSTALL_BIN}")
+    gui_src = os.path.join(os.path.dirname(src), "risemode-gui")
+    if os.path.exists(gui_src) and gui_src != "/usr/local/bin/risemode-gui":
+        shutil.copy(gui_src, "/usr/local/bin/risemode-gui")
+        os.chmod("/usr/local/bin/risemode-gui", 0o755)
+        print("Copiado para /usr/local/bin/risemode-gui")
     with open(UDEV_RULE_PATH, "w") as f:
         f.write(
             'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1a2c", MODE="0660", TAG+="uaccess"\n'

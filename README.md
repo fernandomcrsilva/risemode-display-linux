@@ -49,6 +49,19 @@ risemode-display run -s coretemp  # força um sensor hwmon específico
 risemode-display off            # apaga o display
 ```
 
+## Modos do segundo dígito (W / %)
+
+O campo `mode` em `/etc/risemode-display.conf` (editável pela GUI) controla o
+que aparece ao lado da temperatura:
+
+- `percent` — uso da CPU em % (padrão)
+- `watts` — potência da CPU em W (RAPL)
+- `system` — potência do sistema em W: CPU (RAPL) + GPU (amdgpu/nvidia-smi).
+  É uma estimativa — placa-mãe, RAM e discos não têm sensor de potência.
+
+Na GUI, o toggle W/% escolhe entre % e watts; a caixa "W do sistema inteiro"
+faz o W somar CPU + GPU.
+
 ## Solução de problemas
 
 - **`lsusb` não mostra `1a2c:4984`** — confira o cabo USB interno do cooler na

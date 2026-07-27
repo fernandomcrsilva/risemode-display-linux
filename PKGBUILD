@@ -1,6 +1,6 @@
 # Maintainer: você :)
 pkgname=risemode-display
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Driver Linux para o display de temperatura dos coolers Rise Mode (VID 1a2c PID 4984)"
 arch=('any')
